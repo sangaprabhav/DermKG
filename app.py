@@ -419,14 +419,23 @@ def validate_node_name(name: str) -> bool:
 def get_driver():
     """Establishes a connection to the Neo4j database."""
     try:
-        driver = GraphDatabase.driver(
-            NEO4J_URI, 
-            auth=(NEO4J_USER, NEO4J_PASSWORD),
-            max_connection_lifetime=30 * 60,
-            max_connection_pool_size=10 if IS_STREAMLIT_CLOUD else 25,
-            connection_acquisition_timeout=60,
-            encrypted=True
-        )
+        # Determine if we need to explicitly set encryption based on URI scheme
+        uri_scheme = NEO4J_URI.split('://')[0].lower()
+        encrypted_schemes = ['neo4j+s', 'neo4j+ssc', 'bolt+s', 'bolt+ssc']
+        
+        # Only set encrypted=True for schemes that don't already include encryption
+        driver_config = {
+            'auth': (NEO4J_USER, NEO4J_PASSWORD),
+            'max_connection_lifetime': 30 * 60,
+            'max_connection_pool_size': 10 if IS_STREAMLIT_CLOUD else 25,
+            'connection_acquisition_timeout': 60,
+        }
+        
+        # Add encryption setting only if URI scheme doesn't already specify it
+        if uri_scheme not in encrypted_schemes:
+            driver_config['encrypted'] = True
+        
+        driver = GraphDatabase.driver(NEO4J_URI, **driver_config)
         
         # Test the connection
         with driver.session() as session:
