@@ -4,7 +4,7 @@ streamlit-agraph
 transformers
 torch
 accelerate
-sentencepiece
+
 protobuf
 numpy
 pandas
