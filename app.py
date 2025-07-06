@@ -38,47 +38,52 @@ st.set_page_config(
 def load_llm():
     """Load a lightweight LLM for generating graph descriptions."""
     try:
-        # Try different model options in order of preference (optimized for cloud deployment)
+        import gc
+        # Clear any existing CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Try different model options with memory limits
         model_options = [
-            "microsoft/DialoGPT-small",   # Lightweight option for cloud
-            "gpt2",                       # Fallback option
-            "distilgpt2"                  # Even lighter fallback
+            "microsoft/DialoGPT-small",
+            "distilgpt2",  # Even smaller
         ]
         
         for model_name in model_options:
             try:
-                # Use text generation pipeline for better compatibility
                 tokenizer = AutoTokenizer.from_pretrained(
-                    model_name, 
-                    cache_dir=None,  # Don't cache to save space
-                    local_files_only=False
+                    model_name,
+                    use_fast=True,
+                    model_max_length=256  # Reduced from 512
                 )
-                # Use AutoModelForCausalLM for text generation
+                
+                # Load with minimal memory footprint
                 model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    cache_dir=None,  # Don't cache to save space
-                    local_files_only=False,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                    device_map="auto" if torch.cuda.is_available() else None,
-                    low_cpu_mem_usage=True
+                    torch_dtype=torch.float32,  # Use float32 for CPU
+                    low_cpu_mem_usage=True,
+                    device_map=None  # Don't use auto device map
                 )
                 
-                # Add padding token if not present
+                # Add padding token
                 if tokenizer.pad_token is None:
                     tokenizer.pad_token = tokenizer.eos_token
-                
+                    
                 st.success(f"✅ Loaded LLM: {model_name}")
                 return tokenizer, model
+                
             except Exception as e:
-                st.warning(f"Failed to load {model_name}: {str(e)[:100]}...")
+                # Clean up on failure
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 continue
-        
-        # If all models fail, return None but don't error - app can still function
+                
         st.info("💡 LLM models not available - using rule-based responses only")
         return None, None
         
-    except Exception as e:
-        st.info(f"💡 LLM loading disabled - using rule-based responses only")
+    except Exception:
+        st.info("💡 LLM loading disabled - using rule-based responses only")
         return None, None
 
 def generate_graph_description(nodes, edges, selected_concept=None):
@@ -365,25 +370,37 @@ def get_node_color(node_name: str) -> str:
         return "#FFD166"  # Yellow
     return "#4D9DE0"      # Blue (default for diseases)
 
+# --- Input Validation ---
+def validate_node_name(name: str) -> bool:
+    """Validate node name to prevent issues."""
+    if not name or not isinstance(name, str):
+        return False
+    if len(name) > 500:
+        return False
+    return True
+
 # --- Caching Neo4j Driver and Node Data ---
 @st.cache_resource
 def get_driver():
     """Establishes a connection to the Neo4j database."""
     try:
+        from neo4j import GraphDatabase, TRUST_SYSTEM_CA_SIGNED_CERTIFICATES
+        
         driver = GraphDatabase.driver(
             NEO4J_URI, 
             auth=(NEO4J_USER, NEO4J_PASSWORD),
-            max_connection_lifetime=30 * 60,  # 30 minutes
-            max_connection_pool_size=50,
-            connection_acquisition_timeout=30,  # 30 seconds
-            encrypted=True
+            max_connection_lifetime=30 * 60,
+            max_connection_pool_size=25,  # Reduced from 50
+            connection_acquisition_timeout=60,  # Increased timeout
+            encrypted=True,
+            trust=TRUST_SYSTEM_CA_SIGNED_CERTIFICATES
         )
         driver.verify_connectivity()
         st.success("✅ Connected to Neo4j database")
         return driver
     except Exception as e:
         st.error(f"❌ Failed to connect to Neo4j: {str(e)}")
-        st.info("Please ensure your Neo4j credentials are correctly configured in the app secrets.")
+        st.info("Please check your Neo4j credentials in the app secrets.")
         return None
 
 @st.cache_data
@@ -405,7 +422,7 @@ def get_node_data(_driver):
     
     return pretty_names, pretty_to_full_map
 
-# --- Initialize chat history ---
+# --- Initialize session state ---
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
@@ -415,6 +432,10 @@ if "current_graph_description" not in st.session_state:
 # --- Initialize path context ---
 if "current_path_context" not in st.session_state:
     st.session_state.current_path_context = None
+
+# --- Initialize chat input state ---
+if "chat_input_value" not in st.session_state:
+    st.session_state.chat_input_value = ""
 
 # --- Main App ---
 st.title("🔬 DermKG: The Dermatology Knowledge Graph Explorer")
@@ -461,12 +482,15 @@ with tab1:
             key='selected_node_key'
         )
 
-        if selected_pretty_name:
+        if selected_pretty_name and validate_node_name(selected_pretty_name):
             # Clear path context when exploring individual concepts
             st.session_state.current_path_context = None
             
             # Translate the selected "pretty name" back to the full name for the query
             selected_full_name = pretty_to_full_map.get(selected_pretty_name)
+            if not selected_full_name:
+                st.error("Selected concept not found in database.")
+                st.stop()
             st.success(f"Displaying neighbors for: **{selected_pretty_name}**")
             
             query = "MATCH (p:Concept {name: $node_name})-[r]-(neighbor:Concept) RETURN p, r, neighbor LIMIT 50"
@@ -474,10 +498,11 @@ with tab1:
             edges = []
             node_ids = set()
 
-            with driver.session(database="neo4j") as session:
-                result = session.run(query, node_name=selected_full_name)
-                for record in result:
-                    source_node, rel, target_node = record["p"], record["r"], record["neighbor"]
+            with st.spinner("Loading graph data..."):
+                with driver.session(database="neo4j") as session:
+                    result = session.run(query, node_name=selected_full_name)
+                    for record in result:
+                        source_node, rel, target_node = record["p"], record["r"], record["neighbor"]
 
                     # Use full names for IDs and pretty names for labels
                     if source_node.element_id not in node_ids:
@@ -537,8 +562,21 @@ with tab1:
         else:
             placeholder = "Ask about the graph or dermatology concepts..."
         
-        user_input = st.text_input("Ask about the graph or dermatology concepts:", 
-                                  placeholder=placeholder, key="chat_input")
+        # Chat input with clear functionality
+        col1, col2 = st.columns([4, 1])
+        
+        with col1:
+            user_input = st.text_input(
+                "Ask about the graph or dermatology concepts:", 
+                value=st.session_state.chat_input_value,
+                placeholder=placeholder, 
+                key="chat_input"
+            )
+        
+        with col2:
+            if st.button("Clear", key="clear_chat_tab1"):
+                st.session_state.chat_history = []
+                st.rerun()
         
         # Show helpful prompts based on context
         if st.session_state.current_path_context:
@@ -548,13 +586,15 @@ with tab1:
         
         if st.button("Send", key="send_chat"):
             if user_input:
-                # Generate AI response based on user input and current graph
                 ai_response = generate_chat_response(user_input, st.session_state.current_graph_description)
-                
-                # Add to chat history
                 st.session_state.chat_history.append((user_input, ai_response))
                 
+                # Limit chat history
+                if len(st.session_state.chat_history) > 50:
+                    st.session_state.chat_history = st.session_state.chat_history[-50:]
+                
                 # Clear input
+                st.session_state.chat_input_value = ""
                 st.rerun()
 
 # --- TAB 2: Find a Path ---
@@ -573,7 +613,7 @@ with tab2:
         with path_col2:
             target_pretty_name = st.selectbox("Select a Target Concept", options=pretty_node_names, index=None, key="target_path")
 
-        if source_pretty_name and target_pretty_name:
+        if source_pretty_name and target_pretty_name and validate_node_name(source_pretty_name) and validate_node_name(target_pretty_name):
             if source_pretty_name == target_pretty_name:
                 st.warning("Source and Target concepts cannot be the same.")
             else:
@@ -581,13 +621,18 @@ with tab2:
                 source_full_name = pretty_to_full_map.get(source_pretty_name)
                 target_full_name = pretty_to_full_map.get(target_pretty_name)
                 
+                if not source_full_name or not target_full_name:
+                    st.error("One or both selected concepts not found in database.")
+                    st.stop()
+                
                 path_query = "MATCH path = shortestPath((source:Concept {name: $source_name})-[*..10]->(target:Concept {name: $target_name})) RETURN path"
                 path_nodes = []
                 path_edges = []
                 path_node_ids = set()
 
-                with driver.session(database="neo4j") as session:
-                    result = session.run(path_query, source_name=source_full_name, target_name=target_full_name).single()
+                with st.spinner("Finding shortest path..."):
+                    with driver.session(database="neo4j") as session:
+                        result = session.run(path_query, source_name=source_full_name, target_name=target_full_name).single()
                 if result:
                     path = result["path"]
                     
@@ -639,6 +684,7 @@ with tab2:
                     st.write(f"**Path length:** {len(path.nodes)} concepts")
                 else:
                     st.error(f"No path found between '{source_pretty_name}' and '{target_pretty_name}'.")
+                    st.session_state.current_path_context = None
     
     with col2:
         st.subheader("💬 Chat Assistant")
@@ -658,8 +704,21 @@ with tab2:
         else:
             placeholder = "Ask about the path or relationships..."
         
-        user_input = st.text_input("Ask about the path or relationships:", 
-                                  placeholder=placeholder, key="chat_input_path")
+        # Chat input with clear functionality
+        col1, col2 = st.columns([4, 1])
+        
+        with col1:
+            user_input = st.text_input(
+                "Ask about the path or relationships:", 
+                value=st.session_state.chat_input_value,
+                placeholder=placeholder, 
+                key="chat_input_path"
+            )
+        
+        with col2:
+            if st.button("Clear", key="clear_chat_tab2"):
+                st.session_state.chat_history = []
+                st.rerun()
         
         # Show helpful prompts based on context
         if st.session_state.current_path_context:
@@ -669,11 +728,13 @@ with tab2:
         
         if st.button("Send", key="send_chat_path"):
             if user_input:
-                # Generate AI response based on user input and current graph
                 ai_response = generate_chat_response(user_input, st.session_state.current_graph_description)
-                
-                # Add to chat history
                 st.session_state.chat_history.append((user_input, ai_response))
                 
+                # Limit chat history
+                if len(st.session_state.chat_history) > 50:
+                    st.session_state.chat_history = st.session_state.chat_history[-50:]
+                
                 # Clear input
+                st.session_state.chat_input_value = ""
                 st.rerun()
