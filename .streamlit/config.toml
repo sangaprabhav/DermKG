@@ -1,0 +1,36 @@
+[global]
+# Streamlit Community Cloud optimizations
+developmentMode = false
+dataFrameSerialization = "legacy"
+
+[server]
+# Server configuration for production
+runOnSave = false
+allowRunOnSave = false
+port = 8501
+enableCORS = false
+enableXsrfProtection = true
+maxUploadSize = 200
+
+[browser]
+# Browser configuration
+gatherUsageStats = false
+showErrorDetails = false
+
+[theme]
+# App theme configuration
+primaryColor = "#06D6A0"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F5F5"
+textColor = "#262730"
+font = "sans serif"
+
+[client]
+# Client configuration
+showErrorDetails = false
+toolbarMode = "minimal"
+
+[logger]
+# Logging configuration
+level = "INFO"
+messageFormat = "%(asctime)s - %(name)s - %(levelname)s - %(message)s" 
