@@ -1,15 +1,30 @@
+import os
+import gc
 import streamlit as st
 from neo4j import GraphDatabase
 from streamlit_agraph import agraph, Node, Edge, Config
 import random
 import warnings
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
 import json
 from datetime import datetime
 
-# Suppress common warnings
+# Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Deployment configuration
+IS_STREAMLIT_CLOUD = os.getenv('STREAMLIT_SHARING_MODE', 'false').lower() == 'true'
+ENABLE_LLM = os.getenv('ENABLE_LLM', 'false').lower() == 'true' and not IS_STREAMLIT_CLOUD
+
+# Import ML libraries only if LLM is enabled
+if ENABLE_LLM:
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import torch
+    except ImportError:
+        ENABLE_LLM = False
+        st.warning("ML libraries not available. Using rule-based responses only.")
+
 
 # --- Neo4j Connection Configuration ---
 # Use Streamlit secrets for production deployment
@@ -37,106 +52,89 @@ st.set_page_config(
 @st.cache_resource
 def load_llm():
     """Load a lightweight LLM for generating graph descriptions."""
-    try:
-        import gc
-        # Clear any existing CUDA cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Try different model options with memory limits
-        model_options = [
-            "microsoft/DialoGPT-small",
-            "distilgpt2",  # Even smaller
-        ]
-        
-        for model_name in model_options:
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model_name,
-                    use_fast=True,
-                    model_max_length=256  # Reduced from 512
-                )
-                
-                # Load with minimal memory footprint
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.float32,  # Use float32 for CPU
-                    low_cpu_mem_usage=True,
-                    device_map=None  # Don't use auto device map
-                )
-                
-                # Add padding token
-                if tokenizer.pad_token is None:
-                    tokenizer.pad_token = tokenizer.eos_token
-                    
-                st.success(f"✅ Loaded LLM: {model_name}")
-                return tokenizer, model
-                
-            except Exception as e:
-                # Clean up on failure
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
-                
-        st.info("💡 LLM models not available - using rule-based responses only")
+    if not ENABLE_LLM:
         return None, None
+    
+    try:
+        # Clear memory before loading
+        gc.collect()
         
-    except Exception:
-        st.info("💡 LLM loading disabled - using rule-based responses only")
+        # Try only the smallest model for Streamlit Cloud
+        model_name = "distilgpt2"
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=True,
+            model_max_length=128  # Reduced further
+        )
+        
+        # Load with absolute minimal memory footprint
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+            device_map=None
+        )
+        
+        # Add padding token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            
+        return tokenizer, model
+        
+    except Exception as e:
+        gc.collect()
         return None, None
 
 def generate_graph_description(nodes, edges, selected_concept=None):
-    """Generate a description of the current graph using the LLM."""
-    tokenizer, model = load_llm()
-    if not tokenizer or not model:
-        return "Unable to generate description - LLM not available."
-    
-    # Create a prompt based on the graph data
-    node_names = [node.label for node in nodes[:10]]  # Limit to first 10 nodes for brevity
+    """Generate a description of the current graph using the LLM or rules."""
+    # Always provide a rule-based description first
+    node_count = len(nodes)
+    edge_count = len(edges)
     edge_types = list(set([edge.label for edge in edges[:10]]))
     
+    base_description = f"This graph shows {node_count} dermatology concepts with {edge_count} relationships"
     if selected_concept:
-        prompt = f"Describe the dermatology knowledge graph centered around '{selected_concept}'. "
-    else:
-        prompt = "Describe this dermatology knowledge graph. "
+        base_description = f"The graph centered on '{selected_concept}' shows {node_count} connected concepts"
     
-    prompt += f"It contains {len(nodes)} concepts including: {', '.join(node_names[:5])}. "
-    prompt += f"The relationships include: {', '.join(edge_types[:3])}. "
-    prompt += "Provide a brief medical insight about the connections shown."
+    if edge_types:
+        base_description += f", including relationships like: {', '.join(edge_types[:3])}"
     
-    try:
-        # Generate response with attention mask
-        inputs = tokenizer(
-            prompt, 
-            return_tensors="pt", 
-            max_length=512, 
-            truncation=True, 
-            padding=True
-        )
-        
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                max_length=inputs.input_ids.shape[1] + 100,
-                num_return_sequences=1,
-                temperature=0.7,
-                pad_token_id=tokenizer.pad_token_id,
-                do_sample=True,
-                top_p=0.9
-            )
-        
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # Extract only the generated part (after the prompt)
-        generated_text = response[len(prompt):].strip()
-        
-        if not generated_text:
-            return f"This graph shows {len(nodes)} dermatology concepts with {len(edges)} relationships, centered around {selected_concept if selected_concept else 'various medical concepts'}."
-        
-        return generated_text
-    except Exception as e:
-        return f"This dermatology knowledge graph displays {len(nodes)} interconnected concepts with {len(edges)} relationships, providing insights into medical connections in dermatology."
+    # Try LLM enhancement only if available
+    if ENABLE_LLM:
+        tokenizer, model = load_llm()
+        if tokenizer and model:
+            try:
+                # Very simple prompt to avoid memory issues
+                prompt = f"Medical graph: {base_description}. Insight:"
+                
+                inputs = tokenizer(
+                    prompt, 
+                    return_tensors="pt", 
+                    max_length=50, 
+                    truncation=True, 
+                    padding=True
+                )
+                
+                with torch.no_grad():
+                    outputs = model.generate(
+                        inputs.input_ids,
+                        attention_mask=inputs.attention_mask,
+                        max_new_tokens=30,  # Very limited generation
+                        temperature=0.7,
+                        pad_token_id=tokenizer.pad_token_id,
+                        do_sample=True
+                    )
+                
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                generated_text = response[len(prompt):].strip()
+                
+                if generated_text and len(generated_text) > 10:
+                    return base_description + " " + generated_text
+            except:
+                pass
+    
+    return base_description
 
 def generate_enhanced_path_description(source, destination, intermediate_concepts, relationship_types):
     """Generate a detailed description of a path between two medical concepts."""
@@ -347,6 +345,43 @@ def get_contextual_fallback_response(user_input):
     else:
         return "I can help explain medical concepts and their relationships in the dermatology knowledge graph. Try selecting a concept or finding a path between two concepts, then ask specific questions about their connections."
 
+# Optimize Neo4j queries for deployment
+def safe_neo4j_query(driver, query, params=None, limit=30):
+    """Execute Neo4j query with safety limits for deployment."""
+    # Add default limit if not present
+    if "LIMIT" not in query.upper():
+        query += f" LIMIT {limit}"
+    
+    try:
+        with driver.session(database="neo4j") as session:
+            result = session.run(query, parameters=params or {})
+            return list(result)
+    except Exception as e:
+        st.error(f"Query error: {str(e)[:100]}")
+        return []
+
+# Add memory monitoring for deployment
+def check_memory_usage():
+    """Check memory usage and warn if high."""
+    try:
+        import psutil
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        
+        if memory_mb > 800:  # 800MB threshold for 1GB limit
+            st.warning("⚠️ High memory usage detected. Some features may be limited.")
+            gc.collect()
+            
+        return memory_mb
+    except:
+        return 0
+
+# Add a cleanup function for chat history
+def manage_chat_history():
+    """Keep chat history within limits to prevent memory issues."""
+    if len(st.session_state.chat_history) > st.session_state.chat_history_limit:
+        st.session_state.chat_history = st.session_state.chat_history[-st.session_state.chat_history_limit:]
+
 # --- Helper Functions ---
 def get_pretty_name(long_name: str) -> str:
     """
@@ -384,23 +419,30 @@ def validate_node_name(name: str) -> bool:
 def get_driver():
     """Establishes a connection to the Neo4j database."""
     try:
-        from neo4j import GraphDatabase, TRUST_SYSTEM_CA_SIGNED_CERTIFICATES
-        
         driver = GraphDatabase.driver(
             NEO4J_URI, 
             auth=(NEO4J_USER, NEO4J_PASSWORD),
             max_connection_lifetime=30 * 60,
-            max_connection_pool_size=25,  # Reduced from 50
-            connection_acquisition_timeout=60,  # Increased timeout
-            encrypted=True,
-            trust=TRUST_SYSTEM_CA_SIGNED_CERTIFICATES
+            max_connection_pool_size=10 if IS_STREAMLIT_CLOUD else 25,
+            connection_acquisition_timeout=60,
+            encrypted=True
         )
-        driver.verify_connectivity()
+        
+        # Test the connection
+        with driver.session() as session:
+            session.run("RETURN 1")
+            
         st.success("✅ Connected to Neo4j database")
         return driver
+        
     except Exception as e:
         st.error(f"❌ Failed to connect to Neo4j: {str(e)}")
-        st.info("Please check your Neo4j credentials in the app secrets.")
+        st.info("""
+        Please check:
+        1. Your Neo4j instance is running
+        2. Credentials are correctly set in Streamlit secrets
+        3. The database allows remote connections
+        """)
         return None
 
 @st.cache_data
@@ -425,6 +467,9 @@ def get_node_data(_driver):
 # --- Initialize session state ---
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+
+if "chat_history_limit" not in st.session_state:
+    st.session_state.chat_history_limit = 20 if IS_STREAMLIT_CLOUD else 50
 
 if "current_graph_description" not in st.session_state:
     st.session_state.current_graph_description = None
@@ -456,6 +501,22 @@ st.sidebar.markdown("Use the options below to explore the graph.")
 if st.sidebar.button("Show Random Concept", use_container_width=True):
     if pretty_node_names:
         st.session_state.selected_node_key = random.choice(pretty_node_names)
+
+# Add deployment information in sidebar
+if IS_STREAMLIT_CLOUD:
+    st.sidebar.info("🌐 Running on Streamlit Cloud (Limited Resources)")
+    if st.sidebar.button("Clear Memory"):
+        gc.collect()
+        st.cache_resource.clear()
+        st.success("Memory cleared!")
+
+# Show memory usage if psutil is available
+try:
+    memory_mb = check_memory_usage()
+    if memory_mb > 0:
+        st.sidebar.metric("Memory Usage", f"{memory_mb:.0f} MB / 1000 MB")
+except:
+    pass
 
 # --- Tabs for Different Functionalities ---
 tab1, tab2 = st.tabs(["🔍 Explore a Concept", "↔️ Find a Path"])
@@ -493,7 +554,7 @@ with tab1:
                 st.stop()
             st.success(f"Displaying neighbors for: **{selected_pretty_name}**")
             
-            query = "MATCH (p:Concept {name: $node_name})-[r]-(neighbor:Concept) RETURN p, r, neighbor LIMIT 50"
+            query = "MATCH (p:Concept {name: $node_name})-[r]-(neighbor:Concept) RETURN p, r, neighbor LIMIT 30"
             nodes = []
             edges = []
             node_ids = set()
@@ -590,8 +651,7 @@ with tab1:
                 st.session_state.chat_history.append((user_input, ai_response))
                 
                 # Limit chat history
-                if len(st.session_state.chat_history) > 50:
-                    st.session_state.chat_history = st.session_state.chat_history[-50:]
+                manage_chat_history()
                 
                 # Clear input
                 st.session_state.chat_input_value = ""
@@ -625,7 +685,7 @@ with tab2:
                     st.error("One or both selected concepts not found in database.")
                     st.stop()
                 
-                path_query = "MATCH path = shortestPath((source:Concept {name: $source_name})-[*..10]->(target:Concept {name: $target_name})) RETURN path"
+                path_query = "MATCH path = shortestPath((source:Concept {name: $source_name})-[*..5]->(target:Concept {name: $target_name})) RETURN path"
                 path_nodes = []
                 path_edges = []
                 path_node_ids = set()
@@ -732,8 +792,7 @@ with tab2:
                 st.session_state.chat_history.append((user_input, ai_response))
                 
                 # Limit chat history
-                if len(st.session_state.chat_history) > 50:
-                    st.session_state.chat_history = st.session_state.chat_history[-50:]
+                manage_chat_history()
                 
                 # Clear input
                 st.session_state.chat_input_value = ""

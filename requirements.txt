@@ -7,4 +7,5 @@ accelerate
 sentencepiece
 protobuf
 numpy
-pandas 
+pandas
+psutil 

@@ -1,0 +1,5 @@
+# System dependencies for Streamlit Cloud
+# This file should be placed in the root of your repository
+build-essential
+cmake
+pkg-config
